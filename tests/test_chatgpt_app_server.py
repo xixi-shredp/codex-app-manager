@@ -95,8 +95,10 @@ class FakeServer:
             out = {'thread': obj, 'model': cfg.get('model', 'gpt-6.1-sol'),
                    'modelProvider': 'openai', 'cwd': obj['cwd'],
                    'approvalPolicy': cfg.get('approvalPolicy', 'on-request'),
-                   'sandbox': {'type': cfg.get('sandbox', 'workspaceWrite')},
-                   'reasoningEffort': cfg.get('reasoningEffort', 'medium')}
+                   'sandbox': cfg.get('sandboxPolicy', {'type': {'workspace-write': 'workspaceWrite', 'danger-full-access': 'dangerFullAccess', 'read-only': 'readOnly'}.get(cfg.get('sandbox'), 'workspaceWrite')}),
+                   'approvalsReviewer': cfg.get('approvalsReviewer', 'user'),
+                   'serviceTier': cfg.get('serviceTier'),
+                   'reasoningEffort': cfg.get('effort', cfg.get('config', {}).get('model_reasoning_effort'))}
             return out
         if method == 'turn/start':
             return {'turn': {'id': 'turn-1', 'status': 'inProgress', 'items': []}}
@@ -229,6 +231,25 @@ class CLITests(unittest.TestCase):
         self.assertEqual(update['threadId'], 'old-id')
         self.assertEqual(update['model'], 'gpt-6.1-sol')
         self.assertEqual(update['cwd'], str(self.root / 'work'))
+
+    def test_existing_matching_settings_need_no_update_event(self):
+        s = self.server(loaded=['old-id'])
+        p = self.team(id='old-id', sandbox='danger-full-access')
+        s.settings['old-id'] = {'cwd': str(self.root / 'work'), 'model': 'gpt-6.1-sol',
+                                'effort': 'medium', 'sandboxPolicy': {'type': 'dangerFullAccess'}}
+        result = self.run_cli(s, 'set', str(p))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls(s, 'thread/settings/update'), [])
+        self.assertEqual(self.calls(s, 'turn/start'), [])
+        self.assertEqual(self.calls(s, 'thread/start'), [])
+
+    def test_new_matching_settings_need_no_update_event(self):
+        s = self.server()
+        p = self.team(reasoning_effort='high', sandbox='danger-full-access')
+        result = self.run_cli(s, 'set', str(p))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls(s, 'thread/settings/update'), [])
+        self.assertEqual(len(self.calls(s, 'turn/start')), 1)
 
     def test_prevalidates_all_json_before_mutation(self):
         s = self.server()

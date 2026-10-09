@@ -560,9 +560,34 @@ def settings_for(member):
     return params
 
 
+def settings_match(actual, requested):
+    for key, value in requested.items():
+        if key == 'threadId':
+            continue
+        effective = actual.get(key)
+        if key == 'sandboxPolicy' and isinstance(effective, dict):
+            if any(effective.get(k, False if isinstance(v, bool) else []) != v
+                   for k, v in value.items()):
+                return False
+        elif effective != value:
+            return False
+    return True
+
+
 def apply_settings(client, member):
-    # resume joins/subscribes; settings/update actually changes a loaded thread.
+    # The server only emits settings/updated for effective changes. Read the
+    # live snapshot first so a no-op (including a freshly started thread) does
+    # not wait for an event which the server deliberately suppresses.
     params = settings_for(member)
+    snapshot = client.call('thread/resume', {'threadId': member['id'], 'excludeTurns': True})
+    if snapshot.get('thread', {}).get('id') != member['id']:
+        raise CliError(f'{member["name"]}: app-server 返回的 Session ID 不一致。')
+    actual = dict(snapshot)
+    for source, target in [('reasoningEffort', 'effort'), ('sandbox', 'sandboxPolicy')]:
+        if source in snapshot:
+            actual[target] = snapshot[source]
+    if settings_match(actual, params):
+        return
     # Drain stale settings notifications from earlier resume before submitting.
     while True:
         try:

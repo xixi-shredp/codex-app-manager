@@ -30,8 +30,9 @@ approval_policy、approvals_reviewer、service_tier、summary。
 
 id 为 null 时创建新的持久 Session，立即原子回写真实 ID。
 全部新 ID 已写回后，向每个新 Session 发送 team_prompt + 两个换行 + base_prompt。
-已有 ID 先恢复/订阅到当前 App，等待空闲，再调用 thread/settings/update，
-以 thread/settings/updated 确认配置生效；更新名称，但不发送任何 prompt。
+已有 ID 先恢复/订阅到当前 App，等待空闲，读取有效配置；已一致时无需更新。
+有变化时调用 thread/settings/update，以 thread/settings/updated 确认配置生效；
+更新名称，但不发送任何 prompt。配置未变化时服务端不会发送更新通知。
 team_prompt/base_prompt 是新成员初始化文本，set 不重新注入已有成员的初始化文本。
 接受一个或多个 JSON；全部 JSON 先校验，再操作 App。
 
