@@ -1,0 +1,834 @@
+#!/usr/bin/env python3
+"""Standard-library Unix WebSocket JSON-RPC client. Never starts a server."""
+from __future__ import annotations
+
+import base64
+import concurrent.futures
+import hashlib
+import json
+import os
+import queue
+import socket
+import struct
+import threading
+from typing import Any
+
+
+class AppServerError(RuntimeError):
+    pass
+
+
+class RpcError(AppServerError):
+    def __init__(self, method: str, error: Any):
+        self.method, self.error = method, error
+        super().__init__(f"{method}: {error}")
+
+
+class ConnectionClosed(AppServerError):
+    pass
+
+
+class AppServerClient:
+    MAX_MESSAGE = 32 * 1024 * 1024
+    MAX_HEADER = 64 * 1024
+
+    def __init__(self, socket_path: str, rpc_timeout: float = 30):
+        self.socket_path = os.path.expanduser(socket_path)
+        self.rpc_timeout = rpc_timeout
+        self.notifications: queue.Queue[dict] = queue.Queue()
+        self.peer_pid = self.peer_uid = self.peer_gid = None
+        self._socket = None
+        self._reader = None
+        self._buffer = bytearray()
+        self._lock = threading.Lock()
+        self._send_lock = threading.Lock()
+        self._pending = {}
+        self._next_id = 0
+        self._failure = None
+
+    def __enter__(self):
+        try:
+            self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self._socket.settimeout(self.rpc_timeout)
+            self._socket.connect(self.socket_path)
+            if hasattr(socket, "SO_PEERCRED"):
+                self.peer_pid, self.peer_uid, self.peer_gid = struct.unpack(
+                    "3i", self._socket.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            self._handshake()
+            self._socket.settimeout(None)
+            self._reader = threading.Thread(target=self._read_loop, daemon=True,
+                                            name="app-server-websocket-reader")
+            self._reader.start()
+            self.call("initialize", {
+                "clientInfo": {"name": "codex-app-manager", "version": "1.0"},
+                "capabilities": {"experimentalApi": True},
+            })
+            self.notify("initialized", {})
+            return self
+        except BaseException:
+            self.close()
+            raise
+
+    def __exit__(self, *args):
+        self.close()
+
+    def _handshake(self):
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        request = ("GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n"
+                   "Connection: Upgrade\r\nSec-WebSocket-Key: " + key +
+                   "\r\nSec-WebSocket-Version: 13\r\n\r\n")
+        self._socket.sendall(request.encode("ascii"))
+        while b"\r\n\r\n" not in self._buffer:
+            data = self._socket.recv(4096)
+            if not data:
+                raise ConnectionClosed("Socket closed during WebSocket handshake")
+            self._buffer.extend(data)
+            if len(self._buffer) > self.MAX_HEADER:
+                raise AppServerError("WebSocket handshake header exceeds limit")
+        header, rest = bytes(self._buffer).split(b"\r\n\r\n", 1)
+        self._buffer[:] = rest
+        lines = header.decode("iso-8859-1").split("\r\n")
+        status = lines[0].split()
+        if len(status) < 2 or status[1] != "101":
+            raise AppServerError(f"WebSocket upgrade rejected: {lines[0]}")
+        headers = {}
+        for line in lines[1:]:
+            if ":" not in line:
+                raise AppServerError("Malformed WebSocket response header")
+            name, value = line.split(":", 1)
+            headers[name.lower()] = value.strip()
+        expected = base64.b64encode(hashlib.sha1(
+            (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()).decode("ascii")
+        if headers.get("sec-websocket-accept") != expected:
+            raise AppServerError("Invalid WebSocket Sec-WebSocket-Accept")
+        if headers.get("upgrade", "").lower() != "websocket" or "upgrade" not in {
+            t.strip().lower() for t in headers.get("connection", "").split(",")
+        }:
+            raise AppServerError("Invalid WebSocket Upgrade/Connection headers")
+        if "sec-websocket-extensions" in headers:
+            raise AppServerError("Unrequested WebSocket extensions")
+
+    def _read_exact(self, length):
+        while len(self._buffer) < length:
+            data = self._socket.recv(min(65536, length - len(self._buffer)))
+            if not data:
+                raise ConnectionClosed("App-server socket closed")
+            self._buffer.extend(data)
+        result = bytes(self._buffer[:length])
+        del self._buffer[:length]
+        return result
+
+    def _send_frame(self, opcode, data=b""):
+        if len(data) > self.MAX_MESSAGE:
+            raise AppServerError("Outgoing WebSocket message exceeds limit")
+        mask = os.urandom(4)
+        length = len(data)
+        if length < 126:
+            header = bytes([0x80 | opcode, 0x80 | length])
+        elif length <= 65535:
+            header = bytes([0x80 | opcode, 0x80 | 126]) + struct.pack("!H", length)
+        else:
+            header = bytes([0x80 | opcode, 0x80 | 127]) + struct.pack("!Q", length)
+        masked = bytes(byte ^ mask[i % 4] for i, byte in enumerate(data))
+        with self._send_lock:
+            self._socket.sendall(header + mask + masked)
+
+    def _send_json(self, value):
+        self._send_frame(1, json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+    def notify(self, method, params):
+        with self._lock:
+            if self._failure:
+                raise self._failure
+        self._send_json({"method": method, "params": params})
+
+    def call(self, method, params, timeout=None):
+        future = concurrent.futures.Future()
+        with self._lock:
+            if self._failure:
+                raise self._failure
+            self._next_id += 1
+            request_id = self._next_id
+            self._pending[request_id] = future
+        try:
+            self._send_json({"id": request_id, "method": method, "params": params})
+            response = future.result(timeout=self.rpc_timeout if timeout is None else timeout)
+        except concurrent.futures.TimeoutError as exc:
+            raise AppServerError(f"Timed out waiting for {method}; request outcome is unknown") from exc
+        finally:
+            with self._lock:
+                self._pending.pop(request_id, None)
+        if "error" in response:
+            raise RpcError(method, response["error"])
+        return response.get("result")
+
+    def wait_notification(self, timeout=None):
+        """Block until an event. Server requests have _server_request=True.
+
+        No approval request is automatically answered. Connection failure raises
+        ConnectionClosed after earlier queued events have been delivered.
+        """
+        try:
+            item = self.notifications.get(timeout=timeout)
+        except queue.Empty:
+            with self._lock:
+                if self._failure:
+                    raise self._failure
+            raise
+        if item.get("_connection_closed"):
+            # Keep the sentinel available for subsequent or parallel waiters.
+            self.notifications.put(item)
+            raise ConnectionClosed(item["message"])
+        return item
+
+    def _dispatch(self, data):
+        try:
+            value = json.loads(data.decode("utf-8"))
+        except (UnicodeError, ValueError) as exc:
+            raise AppServerError("Invalid JSON/UTF-8 from app-server") from exc
+        if not isinstance(value, dict):
+            raise AppServerError("JSON-RPC message must be an object")
+        if "method" in value:
+            if "id" in value:
+                value["_server_request"] = True
+                value["_interaction_required"] = (
+                    "App-server requested client interaction; no approval was sent")
+            self.notifications.put(value)
+        elif "id" in value:
+            with self._lock:
+                future = self._pending.get(value["id"])
+                if future is not None and not future.done():
+                    future.set_result(value)
+        else:
+            raise AppServerError("Invalid JSON-RPC message")
+
+    def _read_loop(self):
+        fragments = bytearray()
+        message_opcode = None
+        try:
+            while True:
+                b1, b2 = self._read_exact(2)
+                final, opcode = bool(b1 & 0x80), b1 & 0x0f
+                if b1 & 0x70 or b2 & 0x80:
+                    raise AppServerError("Unexpected WebSocket RSV bits or masked server frame")
+                length = b2 & 0x7f
+                if length == 126:
+                    length = struct.unpack("!H", self._read_exact(2))[0]
+                elif length == 127:
+                    length = struct.unpack("!Q", self._read_exact(8))[0]
+                if length > self.MAX_MESSAGE:
+                    raise AppServerError("Incoming WebSocket frame exceeds limit")
+                if opcode >= 8 and (not final or length > 125):
+                    raise AppServerError("Invalid WebSocket control frame")
+                payload = self._read_exact(length)
+                if opcode == 8:
+                    if len(payload) == 1:
+                        raise AppServerError("Invalid WebSocket close frame")
+                    self._send_frame(8, payload)
+                    raise ConnectionClosed("App-server sent WebSocket close")
+                if opcode == 9:
+                    self._send_frame(10, payload)
+                    continue
+                if opcode == 10:
+                    continue
+                if opcode == 1:
+                    if message_opcode is not None:
+                        raise AppServerError("New message before fragmented message completed")
+                    message_opcode = 1
+                elif opcode == 0:
+                    if message_opcode is None:
+                        raise AppServerError("Unexpected WebSocket continuation")
+                else:
+                    raise AppServerError(f"Unsupported WebSocket opcode: {opcode}")
+                fragments.extend(payload)
+                if len(fragments) > self.MAX_MESSAGE:
+                    raise AppServerError("Incoming WebSocket message exceeds limit")
+                if final:
+                    self._dispatch(bytes(fragments))
+                    fragments.clear()
+                    message_opcode = None
+        except Exception as exc:
+            self._fail(ConnectionClosed(f"App-server connection failed: {exc}"))
+            try:
+                self._socket.close()
+            except OSError:
+                pass
+
+    def _fail(self, error):
+        with self._lock:
+            if self._failure is not None:
+                return
+            self._failure = error
+            for future in self._pending.values():
+                if not future.done():
+                    future.set_exception(error)
+        self.notifications.put({"_connection_closed": True, "message": str(error)})
+
+    def close(self):
+        self._fail(ConnectionClosed("App-server client closed"))
+        if self._socket is not None:
+            try:
+                self._socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            self._socket.close()
+        if self._reader is not None and threading.current_thread() is not self._reader:
+            self._reader.join(timeout=2)
+
+import argparse
+import contextlib
+import fcntl
+import math
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import unicodedata
+import time
+from pathlib import Path
+
+
+class CliError(AppServerError):
+    pass
+
+
+def emit(**record):
+    print(json.dumps(record, ensure_ascii=False), flush=True)
+
+
+def discover_socket(explicit=None):
+    if explicit:
+        path = Path(explicit).expanduser().absolute()
+    else:
+        codex = shutil.which('codex')
+        if not codex:
+            raise CliError('找不到 codex；请将实际 Codex CLI 加入 PATH，或指定 --socket。')
+        try:
+            result = subprocess.run([codex, 'app-server', 'daemon', 'version'], capture_output=True,
+                                    text=True, timeout=15, check=True)
+            info = json.loads(result.stdout)
+        except (subprocess.SubprocessError, ValueError) as exc:
+            raise CliError('无法查询正在运行的 App app-server；不会自动启动服务。') from exc
+        if info.get('status') != 'running' or not info.get('socketPath'):
+            raise CliError('App app-server 未运行或未公布 socket 地址；请先打开 App。')
+        path = Path(info['socketPath']).expanduser()
+    try:
+        if not stat.S_ISSOCK(path.stat().st_mode):
+            raise CliError(f'不是 Unix socket：{path}')
+    except FileNotFoundError as exc:
+        raise CliError(f'App socket 不存在：{path}；请先打开 App。') from exc
+    return str(path)
+
+
+def loaded_ids(client):
+    result, cursor = set(), None
+    while True:
+        params = {} if cursor is None else {'cursor': cursor}
+        response = client.call('thread/loaded/list', params)
+        result.update(response.get('data', []))
+        cursor = response.get('nextCursor')
+        if not cursor:
+            return result
+
+
+def require_owned(client, thread_id):
+    if thread_id not in loaded_ids(client):
+        raise CliError(f'Session {thread_id} 不由当前 App app-server 持有（未加载）；send 不会自动恢复它。')
+
+
+def remaining(deadline):
+    if deadline is None:
+        return None
+    seconds = deadline - time.monotonic()
+    if seconds <= 0:
+        raise CliError('等待 Session 空闲超时；没有发送 prompt。')
+    return seconds
+
+
+def check_interaction(event):
+    if event.get('_server_request'):
+        print('app-server 请求交互，请在 App 中处理：' + event.get('method', '?'), file=sys.stderr)
+
+
+def wait_idle(client, thread_id, timeout=None, strict_owner=True):
+    deadline = None if timeout is None else time.monotonic() + timeout
+    waiting = False
+    while True:
+        if strict_owner:
+            require_owned(client, thread_id)
+        response = client.call('thread/read', {'threadId': thread_id, 'includeTurns': False})
+        status = response['thread'].get('status', {}).get('type')
+        if status == 'idle':
+            return
+        if status != 'active':
+            raise CliError(f'Session {thread_id} 状态为 {status!r}，不能发送或更新。')
+        if not waiting:
+            print(f'Session {thread_id} 正忙；等待当前 turn 完成（Ctrl+C 取消）。', file=sys.stderr)
+            waiting = True
+        while True:
+            try:
+                event = client.wait_notification(timeout=remaining(deadline))
+            except queue.Empty as exc:
+                raise CliError('等待 Session 空闲超时；没有发送 prompt。') from exc
+            check_interaction(event)
+            params = event.get('params', {})
+            if params.get('threadId') == thread_id and event.get('method') in {
+                'thread/status/changed', 'turn/completed', 'thread/closed', 'thread/archived',
+            }:
+                break
+
+
+@contextlib.contextmanager
+def session_lock(thread_id, deadline=None):
+    folder = Path.home() / '.cache' / 'chatgpt-app-server' / 'locks'
+    folder.mkdir(parents=True, mode=0o700, exist_ok=True)
+    path = folder / (hashlib.sha256(thread_id.encode()).hexdigest() + '.lock')
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+    old_handler = None
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(f'等待另一个命令释放 Session {thread_id} 的发送锁（Ctrl+C 取消）。', file=sys.stderr)
+            if deadline is not None:
+                def expired(signum, frame):
+                    raise CliError('等待 Session 发送锁超时；没有发送 prompt。')
+                old_handler = signal.signal(signal.SIGALRM, expired)
+                signal.setitimer(signal.ITIMER_REAL, remaining(deadline))
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            finally:
+                if old_handler is not None:
+                    signal.setitimer(signal.ITIMER_REAL, 0)
+                    signal.signal(signal.SIGALRM, old_handler)
+                    old_handler = None
+        yield
+    finally:
+        if old_handler is not None:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, old_handler)
+        os.close(fd)
+
+
+def atomic_json(path, document, mode=0o600):
+    fd, temporary = tempfile.mkstemp(prefix='.' + path.name + '.', dir=path.parent)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            json.dump(document, stream, ensure_ascii=False, indent=2)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+class TeamFile:
+    def __init__(self, path, delete_only=False):
+        self.path = Path(path).expanduser().absolute()
+        if self.path.is_symlink():
+            raise CliError(f'团队 JSON 不能是符号链接：{self.path}')
+        self.raw = self.path.read_bytes()
+        self.document = json.loads(self.raw)
+        self.mode = stat.S_IMODE(self.path.stat().st_mode)
+        self.journal_path = self.path.with_name('.' + self.path.name + '.codex-app-manager-state')
+        legacy_journal = self.path.with_name('.' + self.path.name + '.chatgpt-app-server-state')
+        if not self.journal_path.exists() and legacy_journal.exists():
+            self.journal_path = legacy_journal
+        self.journal = json.loads(self.journal_path.read_text()) if self.journal_path.exists() else {}
+        self.members = (validate_delete_members(self.document, self.path) if delete_only
+                        else validate_team(self.document, self.path))
+
+    def acquire(self, stack):
+        path = self.path.with_name(self.path.name + '.chatgpt-app-server.lock')
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+        stack.callback(os.close, fd)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise CliError(f'另一个 set/delete 正在处理 {self.path}。') from exc
+        self.check_unchanged()
+        # A competing creator may change the journal without changing JSON.
+        if self.journal_path.is_symlink():
+            raise CliError(f'创建状态文件不能是符号链接：{self.journal_path}')
+        self.journal = json.loads(self.journal_path.read_text()) if self.journal_path.exists() else {}
+
+    def check_unchanged(self):
+        if self.path.is_symlink() or self.path.read_bytes() != self.raw:
+            raise CliError(f'{self.path} 被其他程序修改；停止，不覆盖外部修改。')
+
+    def state(self, name, **record):
+        self.journal[name] = record
+        atomic_json(self.journal_path, self.journal)
+
+    def save_id(self, index, thread_id):
+        self.check_unchanged()
+        self.document['sessions'][index]['id'] = thread_id
+        atomic_json(self.path, self.document, self.mode)
+        self.raw = self.path.read_bytes()
+        self.members[index]['id'] = thread_id
+
+
+OPTION_MAP = {'model': 'model', 'reasoning_effort': 'effort', 'approval_policy': 'approvalPolicy',
+              'approvals_reviewer': 'approvalsReviewer', 'service_tier': 'serviceTier',
+              'summary': 'summary'}
+OPTION_KEYS = set(OPTION_MAP) | {'sandbox'}
+
+
+def validate_team(document, path):
+    if not isinstance(document.get('team_prompt'), str):
+        raise CliError(f'{path}: team_prompt 必须为字符串。')
+    defaults = document.get('defaults', {})
+    if not isinstance(defaults, dict):
+        raise CliError(f'{path}: defaults 必须为对象。')
+    sessions = document.get('sessions')
+    if not isinstance(sessions, list) or not sessions:
+        raise CliError(f'{path}: sessions 必须为非空数组。')
+    members, names, ids = [], set(), set()
+    for index, item in enumerate(sessions):
+        field = f'{path}: sessions[{index}]'
+        if not isinstance(item, dict):
+            raise CliError(f'{field} 必须为对象。')
+        for obj in [document, defaults, item]:
+            if any(k in obj for k in ['host', 'host_id', 'project_id']):
+                raise CliError(f'{field}: 只支持同机 App，不支持远程 host 字段。')
+        name = item.get('name')
+        if not isinstance(name, str) or not name.strip() or name in names:
+            raise CliError(f'{field}: name 必须是唯一的非空字符串。')
+        names.add(name)
+        thread_id = item.get('id')
+        if thread_id is not None:
+            if not isinstance(thread_id, str) or not thread_id.strip() or thread_id in ids:
+                raise CliError(f'{field}: id 必须为 null 或唯一非空字符串。')
+            ids.add(thread_id)
+        if not isinstance(item.get('base_prompt'), str):
+            raise CliError(f'{field}: base_prompt 必须为字符串。')
+        cwd = item.get('cwd', defaults.get('cwd', '.'))
+        if not isinstance(cwd, str) or not cwd:
+            raise CliError(f'{field}: cwd 必须为非空字符串。')
+        cwd = Path(cwd).expanduser()
+        cwd = (path.parent / cwd if not cwd.is_absolute() else cwd).resolve()
+        if not cwd.is_dir():
+            raise CliError(f'{field}: cwd 不存在或不是目录：{cwd}')
+        options = {}
+        for obj in [defaults, item]:
+            for key in OPTION_KEYS:
+                if key in obj:
+                    if obj[key] is None:
+                        options.pop(key, None)
+                    elif not isinstance(obj[key], str) or not obj[key].strip():
+                        raise CliError(f'{field}: {key} 必须为非空字符串或 null。')
+                    else:
+                        options[key] = obj[key]
+        for key, allowed in [('sandbox', {'read-only', 'workspace-write', 'danger-full-access'}),
+                             ('approval_policy', {'untrusted', 'on-request', 'never'}),
+                             ('approvals_reviewer', {'user', 'auto_review', 'guardian_subagent'})]:
+            if key in options and options[key] not in allowed:
+                raise CliError(f'{field}: 不支持的 {key}: {options[key]}')
+        if options.get('approvals_reviewer') == 'guardian_subagent':
+            options['approvals_reviewer'] = 'auto_review'
+        if any(obj.get('permissions') is not None for obj in [defaults, item]):
+            raise CliError(f'{field}: 本工具使用 sandbox 字段，不支持 permissions。')
+        members.append({'index': index, 'name': name, 'id': thread_id, 'cwd': str(cwd),
+                        'options': options, 'prompt': document['team_prompt'] + '\n\n' + item['base_prompt']})
+    return members
+
+
+def settings_for(member):
+    options = member['options']
+    params = {'threadId': member['id'], 'cwd': member['cwd']}
+    for key, target in OPTION_MAP.items():
+        if key in options:
+            params[target] = options[key]
+    if 'sandbox' in options:
+        mode = options['sandbox']
+        policy = {'type': {'read-only': 'readOnly', 'workspace-write': 'workspaceWrite',
+                           'danger-full-access': 'dangerFullAccess'}[mode]}
+        if mode == 'workspace-write':
+            policy.update(writableRoots=[member['cwd']], networkAccess=False,
+                          excludeSlashTmp=False, excludeTmpdirEnvVar=False)
+        params['sandboxPolicy'] = policy
+    return params
+
+
+def apply_settings(client, member):
+    # resume joins/subscribes; settings/update actually changes a loaded thread.
+    params = settings_for(member)
+    # Drain stale settings notifications from earlier resume before submitting.
+    while True:
+        try:
+            event = client.notifications.get_nowait()
+        except queue.Empty:
+            break
+        if event.get('_connection_closed'):
+            raise ConnectionClosed(event['message'])
+        check_interaction(event)
+    client.call('thread/settings/update', params)
+    deadline = time.monotonic() + client.rpc_timeout
+    while True:
+        duration = deadline - time.monotonic()
+        if duration <= 0:
+            raise CliError(f'{member["name"]}: 配置更新未收到确认，结果未知；没有发送 prompt。')
+        try:
+            event = client.wait_notification(timeout=duration)
+        except queue.Empty as exc:
+            raise CliError(f'{member["name"]}: 配置更新未收到确认，结果未知；没有发送 prompt。') from exc
+        check_interaction(event)
+        payload = event.get('params', {})
+        if event.get('method') != 'thread/settings/updated' or payload.get('threadId') != member['id']:
+            if event.get('method') == 'error' and payload.get('threadId') == member['id']:
+                raise CliError(f'{member["name"]}: app-server 拒绝配置更新。')
+            continue
+        actual = payload.get('threadSettings', {})
+        for key, requested in params.items():
+            if key == 'threadId':
+                continue
+            effective = actual.get(key)
+            if key == 'sandboxPolicy' and isinstance(effective, dict):
+                if any(effective.get(k, False if isinstance(v, bool) else []) != v for k, v in requested.items()):
+                    raise CliError(f'{member["name"]}: sandboxPolicy 未按要求生效。')
+            elif effective != requested:
+                raise CliError(f'{member["name"]}: 配置字段 {key} 未按要求生效。')
+        return
+
+
+def run_set(client, args):
+    paths = [Path(p).expanduser().absolute() for p in args.files]
+    if len(set(paths)) != len(paths):
+        raise CliError('同一个 JSON 文件不能重复传入。')
+    teams = [TeamFile(p) for p in paths]  # All validation precedes any mutation.
+    all_ids = [m['id'] for t in teams for m in t.members if m['id']]
+    if len(all_ids) != len(set(all_ids)):
+        raise CliError('多个 JSON 中存在重复 Session ID。')
+    with contextlib.ExitStack() as stack:
+        for t in sorted(teams, key=lambda t: str(t.path)):
+            t.acquire(stack)
+        initial = []
+        for team in teams:
+            for member in team.members:
+                if member['id'] is None:
+                    state = team.journal.get(member['name'], {})
+                    if state and state.get('status') != 'deleted':
+                        if state.get('id'):
+                            team.save_id(member['index'], state['id'])
+                            print(f'{member["name"]}: 恢复已知 ID，不重发初始 prompt。', file=sys.stderr)
+                        else:
+                            raise CliError(f'{member["name"]}: 此前创建结果未知；请核对 {team.journal_path}，不会自动重建。')
+                if member['id'] is not None:
+                    deadline = None if args.timeout is None else time.monotonic() + args.timeout
+                    with session_lock(member['id'], deadline):
+                        # User explicitly permits set to load an existing stored ID.
+                        client.call('thread/resume', {'threadId': member['id'], 'excludeTurns': True})
+                        wait_idle(client, member['id'], remaining(deadline))
+                        apply_settings(client, member)
+                        client.call('thread/name/set', {'threadId': member['id'], 'name': member['name']})
+                    emit(action='updated', session_id=member['id'], name=member['name'], prompt_sent=False)
+                    continue
+                team.state(member['name'], status='creating')
+                options = member['options']
+                params = {'cwd': member['cwd'], 'developerInstructions': team.document['team_prompt'],
+                          'ephemeral': False, 'sandbox': options.get('sandbox', 'workspace-write'),
+                          'approvalPolicy': options.get('approval_policy', 'on-request')}
+                for source, target in [('model', 'model'), ('approvals_reviewer', 'approvalsReviewer'),
+                                       ('service_tier', 'serviceTier')]:
+                    if source in options:
+                        params[target] = options[source]
+                if 'reasoning_effort' in options:
+                    params['config'] = {'model_reasoning_effort': options['reasoning_effort']}
+                response = client.call('thread/start', params)
+                thread_id = response.get('thread', {}).get('id')
+                if not isinstance(thread_id, str) or not thread_id:
+                    raise CliError(f'{member["name"]}: thread/start 未返回有效 ID；不会重试。')
+                team.state(member['name'], status='created', id=thread_id)
+                team.save_id(member['index'], thread_id)
+                client.call('thread/name/set', {'threadId': thread_id, 'name': member['name']})
+                apply_settings(client, member)
+                initial.append((team, member))
+        # Persist all IDs before starting models, useful for peer teams.
+        for team, member in initial:
+            deadline = None if args.timeout is None else time.monotonic() + args.timeout
+            with session_lock(member['id'], deadline):
+                wait_idle(client, member['id'], remaining(deadline))
+                team.state(member['name'], status='sending_initial_prompt', id=member['id'])
+                response = client.call('turn/start', {'threadId': member['id'],
+                                       'input': [{'type': 'text', 'text': member['prompt']}]})
+                turn_id = response.get('turn', {}).get('id')
+                if not turn_id:
+                    raise CliError(f'{member["name"]}: turn/start 未返回有效 turn ID；不重发。')
+                team.state(member['name'], status='initial_prompt_sent', id=member['id'], turn_id=turn_id)
+                emit(action='created', session_id=member['id'], name=member['name'],
+                     turn_id=turn_id, prompt_sent=True)
+
+
+def run_send(client, args):
+    deadline = None if args.timeout is None else time.monotonic() + args.timeout
+    with session_lock(args.session_id, deadline):
+        require_owned(client, args.session_id)
+        client.call('thread/resume', {'threadId': args.session_id, 'excludeTurns': True})
+        require_owned(client, args.session_id)
+        wait_idle(client, args.session_id, remaining(deadline))
+        response = client.call('turn/start', {'threadId': args.session_id,
+                               'input': [{'type': 'text', 'text': args.prompt_text}]})
+        turn_id = response.get('turn', {}).get('id')
+        if not turn_id:
+            raise CliError('turn/start 未返回有效 turn ID；请求结果未知，不重发。')
+        emit(action='sent', session_id=args.session_id, turn_id=turn_id)
+
+
+
+def validate_delete_members(document, path):
+    """Deletion only needs names/IDs, even if a previous cwd no longer exists."""
+    if not isinstance(document, dict) or not isinstance(document.get('sessions'), list):
+        raise CliError(f'{path}: sessions 必须为数组。')
+    members = []
+    for index, item in enumerate(document['sessions']):
+        if not isinstance(item, dict) or not isinstance(item.get('name'), str) or not item['name'].strip():
+            raise CliError(f'{path}: sessions[{index}].name 必须为非空字符串。')
+        thread_id = item.get('id')
+        if thread_id is not None and (not isinstance(thread_id, str) or not thread_id.strip()):
+            raise CliError(f'{path}: sessions[{index}].id 必须为 null 或非空字符串。')
+        members.append({'index': index, 'name': item['name'], 'id': thread_id})
+    return members
+
+
+def print_session_table(rows):
+    def cell(value):
+        text = str(value)
+        return ''.join(c if unicodedata.category(c) not in {'Cc', 'Cs'} else repr(c)[1:-1]
+                       for c in text)
+    def width(value):
+        return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in {'W', 'F'} else 1
+                   for c in value)
+    data = [['Session ID', 'Session Name', 'Session 标题']]
+    data.extend([[cell(row[key]) for key in ('id', 'name', 'title')] for row in rows])
+    widths = [max(width(row[column]) for row in data) for column in range(3)]
+    for index, row in enumerate(data):
+        print(' | '.join(value + ' ' * (widths[column] - width(value))
+                         for column, value in enumerate(row)))
+        if index == 0:
+            print('-+-'.join('-' * length for length in widths))
+    sys.stdout.flush()
+
+
+def run_delete(client, args):
+    paths = [Path(p).expanduser().absolute() for p in args.files]
+    if len(set(paths)) != len(paths):
+        raise CliError('同一个 JSON 文件不能重复传入。')
+    teams = [TeamFile(path, delete_only=True) for path in paths]
+    targets = {}
+    for team in teams:
+        for member in team.members:
+            if member['id'] is not None:
+                targets.setdefault(member['id'], []).append((team, member))
+    with contextlib.ExitStack() as stack:
+        for team in sorted(teams, key=lambda item: str(item.path)):
+            team.acquire(stack)
+        for thread_id in sorted(targets):
+            stack.enter_context(session_lock(thread_id))
+        titles, previously_deleted = {}, set()
+        # Query all titles before confirmation or any destructive operation.
+        for thread_id, references in targets.items():
+            if all(team.journal.get(member['name'], {}).get('status') == 'deleted'
+                   and team.journal[member['name']].get('deleted_id') == thread_id
+                   for team, member in references):
+                previously_deleted.add(thread_id)
+                titles[thread_id] = '(已删除，待回写 ID)'
+            else:
+                thread = client.call('thread/read', {'threadId': thread_id, 'includeTurns': False})['thread']
+                if thread.get('id') != thread_id:
+                    raise CliError('app-server 返回的 Session ID 与删除目标不一致；停止。')
+                titles[thread_id] = thread.get('name') or thread.get('preview') or '(无标题)'
+        rows = [{'id': member['id'] if member['id'] is not None else 'null',
+                 'name': member['name'], 'title': titles[member['id']] if member['id'] is not None else '(未创建)'}
+                for team in teams for member in team.members]
+        print_session_table(rows)
+        if not targets:
+            print('没有需要删除的 Session，JSON 未修改。', file=sys.stderr)
+            return
+        print(f'确认永久删除以上 {len(targets)} 个 Session（以及其派生子会话），并将 JSON ID 置为 null？ (y/N) ',
+              file=sys.stderr, end='', flush=True)
+        if sys.stdin.readline().strip().lower() != 'y':
+            print('已取消，未删除 Session，JSON 未修改。', file=sys.stderr)
+            return
+        for team in teams:
+            team.check_unchanged()
+        deleted_count = 0
+        for thread_id, references in targets.items():
+            # Never retry an uncertain RPC or clear IDs on failure.
+            if thread_id not in previously_deleted:
+                client.call('thread/delete', {'threadId': thread_id})
+            # Write a tombstone first so a crash cannot resurrect this ID in set.
+            for team, member in references:
+                team.state(member['name'], status='deleted', deleted_id=thread_id)
+                team.save_id(member['index'], None)
+            deleted_count += 1
+            print(f'已删除 {thread_id}；对应 JSON ID 已置为 null。', file=sys.stderr)
+        print(f'完成：{deleted_count} 个 Session。', file=sys.stderr)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog='codex-app-manager',
+        description='通过运行中的 App Unix WebSocket 创建/配置 Session 或发送 prompt；不会启动 app-server。')
+    def connection_options(p, suppress=False):
+        default = argparse.SUPPRESS if suppress else None
+        p.add_argument('--socket', default=default, help='显式指定运行中的 App Unix socket；默认由 codex 查询')
+        p.add_argument('--rpc-timeout', type=float, default=argparse.SUPPRESS if suppress else 30,
+                       help='连接/RPC/配置确认超时秒数，默认 30')
+    connection_options(parser)
+    subparsers = parser.add_subparsers(dest='command', required=True)
+    set_parser = subparsers.add_parser('set', help='创建 null ID 成员并发送初始 prompt；已有 ID 只更新配置')
+    set_parser.add_argument('files', nargs='+', help='团队 JSON；支持 shell *.json')
+    set_parser.add_argument('--timeout', type=float, help='等待已有 Session 空闲的最大秒数；默认持续等待')
+    connection_options(set_parser, True)
+    send_parser = subparsers.add_parser('send', help='仅向当前 App 已加载的 Session 发送 prompt')
+    send_parser.add_argument('session_id')
+    send_parser.add_argument('prompt_text', help='完整 prompt 文本；包含空格时用引号包裹')
+    send_parser.add_argument('--timeout', type=float, help='等待 Session 空闲的最大秒数；默认持续等待')
+    connection_options(send_parser, True)
+    delete_parser = subparsers.add_parser('delete', help='确认后批量永久删除 JSON 中的 Session，并将 ID 置为 null')
+    delete_parser.add_argument('files', nargs='+', help='一个或多个团队 JSON；支持 shell *.json')
+    connection_options(delete_parser, True)
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        for name in ['rpc_timeout', 'timeout']:
+            value = getattr(args, name, None)
+            if value is not None and (not math.isfinite(value) or value <= 0):
+                raise CliError(f'--{name.replace("_", "-")} 必须大于 0 且有限。')
+        path = discover_socket(args.socket)
+        with AppServerClient(path, rpc_timeout=args.rpc_timeout) as client:
+            if client.peer_uid is not None and client.peer_uid != os.getuid():
+                raise CliError('socket 对端不是当前用户；拒绝连接其他用户的 app-server。')
+            if not args.socket and client.peer_pid is not None:
+                cmdline = Path(f'/proc/{client.peer_pid}/cmdline').read_bytes()
+                if b'app-server' not in cmdline:
+                    raise CliError('发现的 socket 对端不是 app-server 进程。')
+            if args.command == 'set':
+                run_set(client, args)
+            elif args.command == 'delete':
+                run_delete(client, args)
+            else:
+                run_send(client, args)
+        return 0
+    except KeyboardInterrupt:
+        print('已取消。已提交请求不会自动撤销或重发；已有 ID 保留在 JSON 中。', file=sys.stderr)
+        return 130
+    except (AppServerError, OSError, ValueError, KeyError) as exc:
+        print('错误：' + str(exc), file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
