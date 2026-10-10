@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "team_prompt": "你们是 Agent Teams 团队的成员，目标是组织通用 CPU 模拟器与 RTL 建模。",
+  "defaults": {
+    "model": "gpt-6.1-sol",
+    "reasoning_effort": "medium",
+    "sandbox": null,
+    "approval_policy": null
+  },
+  "sessions": [
+    {
+      "name": "Spec Generator",
+      "id": null,
+      "cwd": "./",
+      "base_prompt": "$model-rtl:spec-gen 你负责和人类工程师沟通，确定粗粒度架构 SPEC 和实验运行配置",
+      "reasoning_effort": "high"
+    },
+    {
+      "name": "Modeler",
+      "id": null,
+      "cwd": "./",
+      "base_prompt": "$model-rtl:modeler 你负责模拟器建模, 建模同时补充完善架构 SPEC 到细粒度架构 SPEC, 先阅读基本的 skill 和必要的参考文件, 然后等待 Spec Generator 确定粗粒度架构 SPEC 之后通知你开始模拟器建模"
+    },
+    {
+      "name": "RTL Writer",
+      "id": null,
+      "cwd": "./",
+      "base_prompt": "$model-rtl:rtl-writer 你负责 RTL 建模, 建模同时补充完善细粒度架构 SPEC, 先阅读基本的 skill 和必要的参考文件, 然后等待 Modeler 建模完成并细化架构 SPEC 之后通知你开始 RTL 建模"
+    },
+    {
+      "name": "Calibrator",
+      "id": null,
+      "cwd": "./",
+      "base_prompt": "$model-rtl:calibrator 你负责对比模拟器实现和 RTL 实现结果，并给出校准建议，由 Modeler/RTL Writer 修正，同时可能会补充完善细粒度架构 SPEC, 先阅读基本的 skill 和必要的参考文件, 然后等待 RTL Writer 写完 RTL 之后通知你开始校准"
+    },
+    {
+      "name": "Assertion Writer",
+      "id": null,
+      "cwd": "./",
+      "base_prompt": "$model-rtl:assertion-writer 你负责根据完善的架构 SPEC, 设计编写可定点验证/断言测试的功能覆盖 Testbench, 先阅读基本的 skill 和必要的参考文件, 然后等待 Calibrator 完成校准之后通知你开始"
+    },
+    {
+      "name": "Full Tester",
+      "id": null,
+      "cwd": "./",
+      "base_prompt": "$model-rtl:full-tester 你负责基于模拟器/RTL 完成全量实验测试, 先阅读基本的 skill 和必要的参考文件, 然后等待 Assertion Writer 完成功能覆盖验证测试之后通知你开始"
+    }
+  ]
+}
