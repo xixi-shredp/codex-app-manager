@@ -333,9 +333,9 @@ def loaded_ids(client):
             return result
 
 
-def require_owned(client, thread_id):
+def require_owned(client, thread_id, action='发送 prompt'):
     if thread_id not in loaded_ids(client):
-        raise CliError(f'Session {thread_id} 未在当前 App app-server 中加载；没有发送 prompt。')
+        raise CliError(f'Session {thread_id} 未在当前 App app-server 中加载；没有{action}。')
 
 
 def remaining(deadline):
@@ -701,6 +701,26 @@ def run_send(client, args):
         # Keep overrides absent so their saved settings are preserved.
         client.call('thread/resume', {'threadId': args.session_id, 'excludeTurns': True})
         require_owned(client, args.session_id)
+        if args.force:
+            thread = client.call('thread/read', {
+                'threadId': args.session_id, 'includeTurns': False})['thread']
+            if thread.get('status', {}).get('type') == 'active':
+                turns = client.call('thread/turns/list', {
+                    'threadId': args.session_id, 'limit': 1,
+                    'sortDirection': 'desc', 'itemsView': 'notLoaded',
+                }).get('data', [])
+                if (not turns or turns[0].get('status') != 'inProgress'
+                        or not turns[0].get('id')):
+                    raise CliError('未找到当前运行的 turn；没有发送 prompt，请检查会话状态。')
+                turn_id = turns[0]['id']
+                response = client.call('turn/steer', {
+                    'threadId': args.session_id, 'expectedTurnId': turn_id,
+                    'input': [{'type': 'text', 'text': args.prompt_text}],
+                })
+                if response.get('turnId') != turn_id:
+                    raise CliError('turn/steer 未返回匹配的 turn ID；请求结果未知，不重发。')
+                emit(action='steered', session_id=args.session_id, turn_id=turn_id)
+                return
         wait_idle(client, args.session_id, remaining(deadline))
         response = client.call('turn/start', {'threadId': args.session_id,
                                'input': [{'type': 'text', 'text': args.prompt_text}]})
@@ -708,6 +728,22 @@ def run_send(client, args):
         if not turn_id:
             raise CliError('turn/start 未返回有效 turn ID；请求结果未知，不重发。')
         emit(action='sent', session_id=args.session_id, turn_id=turn_id)
+
+
+def run_goal(client, args):
+    with session_lock(args.session_id):
+        client.call('thread/resume', {'threadId': args.session_id, 'excludeTurns': True})
+        require_owned(client, args.session_id, action='设置 goal')
+        # An explicit user command may update the goal while a turn is active.
+        response = client.call('thread/goal/set', {
+            'threadId': args.session_id, 'objective': args.goal_text,
+            'status': 'active', 'origin': 'user',
+        })
+        goal = response.get('goal')
+        if (not isinstance(goal, dict) or goal.get('threadId') != args.session_id
+                or goal.get('objective') != args.goal_text or goal.get('status') != 'active'):
+            raise CliError('thread/goal/set 未返回匹配的 active goal；请求结果未知，不重试。')
+        emit(action='goal_set', session_id=args.session_id, goal=goal)
 
 
 
@@ -803,7 +839,7 @@ def run_delete(client, args):
 
 def build_parser():
     parser = argparse.ArgumentParser(prog='codex-app-manager',
-        description='通过运行中的 App Unix WebSocket 创建/配置 Session 或发送 prompt；不会启动 app-server。')
+        description='通过运行中的 App Unix WebSocket 创建/配置 Session、发送 prompt 或设置 goal；不会启动 app-server。')
     def connection_options(p, suppress=False):
         default = argparse.SUPPRESS if suppress else None
         p.add_argument('--socket', default=default, help='显式指定运行中的 App Unix socket；默认由 codex 查询')
@@ -818,8 +854,13 @@ def build_parser():
     send_parser = subparsers.add_parser('send', help='自动恢复目标 Session，等待空闲后发送 prompt')
     send_parser.add_argument('session_id')
     send_parser.add_argument('prompt_text', help='完整 prompt 文本；包含空格时用引号包裹')
+    send_parser.add_argument('--force', action='store_true', help='Session 正忙时通过 turn/steer 向当前 turn 追加输入')
     send_parser.add_argument('--timeout', type=float, help='等待 Session 空闲的最大秒数；默认持续等待')
     connection_options(send_parser, True)
+    goal_parser = subparsers.add_parser('goal', help='自动恢复目标 Session 并直接设置 active goal')
+    goal_parser.add_argument('session_id')
+    goal_parser.add_argument('goal_text', help='goal 文本（1–4000 字符）；包含空格时用引号包裹')
+    connection_options(goal_parser, True)
     delete_parser = subparsers.add_parser('delete', help='确认后批量永久删除 JSON 中的 Session，并将 ID 置为 null')
     delete_parser.add_argument('files', nargs='+', help='一个或多个团队 JSON；支持 shell *.json')
     connection_options(delete_parser, True)
@@ -829,6 +870,8 @@ def build_parser():
 def main(argv=None):
     args = build_parser().parse_args(argv)
     try:
+        if args.command == 'goal' and (not args.goal_text.strip() or len(args.goal_text) > 4000):
+            raise CliError('goal 文本必须非空且最多 4000 字符。')
         for name in ['rpc_timeout', 'timeout']:
             value = getattr(args, name, None)
             if value is not None and (not math.isfinite(value) or value <= 0):
@@ -845,6 +888,8 @@ def main(argv=None):
                 run_set(client, args)
             elif args.command == 'delete':
                 run_delete(client, args)
+            elif args.command == 'goal':
+                run_goal(client, args)
             else:
                 run_send(client, args)
         return 0

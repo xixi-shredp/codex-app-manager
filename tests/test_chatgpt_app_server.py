@@ -20,7 +20,7 @@ CLI = os.environ.get('CODEX_APP_MANAGER_CLI') or os.environ.get('CHATGPT_APP_SER
 
 
 class FakeServer:
-    def __init__(self, root, loaded=None, busy=False, wake=True, disconnect=False, fragmented=False, disconnect_create=False, settings_mismatch=False, resume_error=False, resume_load=True):
+    def __init__(self, root, loaded=None, busy=False, wake=True, disconnect=False, fragmented=False, disconnect_create=False, settings_mismatch=False, resume_error=False, resume_load=True, goal_error=False, disconnect_goal=False, goal_mismatch=False, steer_mode=None):
         self.path = str(Path(root) / 'app.sock')
         self.loaded = list(loaded or [])
         self.busy, self.wake = busy, wake
@@ -28,6 +28,8 @@ class FakeServer:
         self.disconnect_create = disconnect_create
         self.settings_mismatch = settings_mismatch
         self.resume_error, self.resume_load = resume_error, resume_load
+        self.goal_error, self.disconnect_goal, self.goal_mismatch = goal_error, disconnect_goal, goal_mismatch
+        self.steer_mode = steer_mode
         self.calls = []
         self.errors = []
         self.settings = {}
@@ -103,6 +105,16 @@ class FakeServer:
             return out
         if method == 'turn/start':
             return {'turn': {'id': 'turn-1', 'status': 'inProgress', 'items': []}}
+        if method == 'thread/turns/list':
+            return {'data': [] if self.steer_mode == 'missing' else [
+                {'id': 'active-turn', 'status': 'completed' if self.steer_mode == 'completed' else 'inProgress', 'items': []}],
+                'nextCursor': None}
+        if method == 'turn/steer':
+            return {'turnId': 'wrong-turn' if self.steer_mode == 'mismatch' else 'active-turn'}
+        if method == 'thread/goal/set':
+            return {'goal': {'threadId': tid, 'objective': 'wrong' if self.goal_mismatch else p['objective'],
+                             'status': p['status'], 'tokenBudget': None, 'tokensUsed': 0,
+                             'timeUsedSeconds': 0, 'createdAt': 1, 'updatedAt': 1}}
         if method == 'config/read':
             return {'config': {}, 'origins': {}, 'layers': []}
         return {}
@@ -147,8 +159,16 @@ class FakeServer:
                         break
                     if self.disconnect_create and method == 'thread/start':
                         break
+                    if self.disconnect_goal and method == 'thread/goal/set':
+                        break
+                    if self.steer_mode == 'disconnect' and method == 'turn/steer':
+                        break
                     if method == 'thread/resume' and self.resume_error:
                         response = {'id': request['id'], 'error': {'code': -32600, 'message': 'session not found'}}
+                    elif method == 'thread/goal/set' and self.goal_error:
+                        response = {'id': request['id'], 'error': {'code': -32600, 'message': 'goal rejected'}}
+                    elif method == 'turn/steer' and self.steer_mode == 'error':
+                        response = {'id': request['id'], 'error': {'code': -32600, 'message': 'active turn changed'}}
                     else:
                         response = {'id': request['id'], 'result': self.result(method, p)}
                     if self.fragmented and method == 'initialize':
@@ -313,6 +333,129 @@ class CLITests(unittest.TestCase):
         for p in self.calls(s, 'thread/resume'):
             self.assertTrue(p.get('excludeTurns'))
             self.assertNotIn('model', p)
+
+    def test_send_force_steers_busy_session_including_after_resume(self):
+        for loaded in ([], ['member']):
+            with self.subTest(loaded=loaded):
+                folder = self.root / ('loaded' if loaded else 'unloaded')
+                folder.mkdir()
+                s = FakeServer(folder, loaded=loaded, busy=True, wake=False)
+                self.servers.append(s)
+                result = self.run_cli(s, 'send', '--force', 'member', '调整方向 α\n继续测试')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.calls(s, 'turn/steer'), [{
+                    'threadId': 'member', 'expectedTurnId': 'active-turn',
+                    'input': [{'type': 'text', 'text': '调整方向 α\n继续测试'}]}])
+                self.assertEqual(self.calls(s, 'thread/turns/list'), [{
+                    'threadId': 'member', 'limit': 1, 'sortDirection': 'desc', 'itemsView': 'notLoaded'}])
+                self.assertEqual(json.loads(result.stdout), {
+                    'action': 'steered', 'session_id': 'member', 'turn_id': 'active-turn'})
+                self.assertEqual(len(self.calls(s, 'thread/resume')), 1)
+                self.assertEqual(len(self.calls(s, 'thread/read')), 1)
+                self.assertEqual(self.calls(s, 'turn/start'), [])
+                self.assertEqual(self.calls(s, 'turn/interrupt'), [])
+                self.assertTrue(s.busy)
+
+    def test_send_force_starts_new_turn_when_idle(self):
+        s = self.server()
+        result = self.run_cli(s, 'send', 'member', '测试', '--force')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.calls(s, 'turn/start')), 1)
+        self.assertEqual(self.calls(s, 'turn/steer'), [])
+        self.assertEqual(json.loads(result.stdout)['action'], 'sent')
+
+    def test_send_force_resume_failure_does_not_send(self):
+        s = self.server(resume_error=True)
+        result = self.run_cli(s, 'send', 'member', '测试', '--force')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.calls(s, 'turn/start'), [])
+        self.assertEqual(self.calls(s, 'turn/steer'), [])
+
+    def test_send_force_failures_never_retry_or_start_new_turn(self):
+        for mode in ('missing', 'completed', 'error', 'disconnect', 'mismatch'):
+            with self.subTest(mode=mode):
+                folder = self.root / mode
+                folder.mkdir()
+                s = FakeServer(folder, busy=True, wake=False, steer_mode=mode)
+                self.servers.append(s)
+                result = self.run_cli(s, 'send', 'member', '测试', '--force')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, '')
+                self.assertEqual(len(self.calls(s, 'turn/steer')), 0 if mode in ('missing', 'completed') else 1)
+                self.assertEqual(self.calls(s, 'turn/start'), [])
+                self.assertEqual(self.calls(s, 'turn/interrupt'), [])
+
+    def check_goal_set(self, s):
+        objective = '完成实现与测试\n保留 Unicode α 和空格'
+        result = self.run_cli(s, 'goal', 'saved-id', objective)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls(s, 'thread/resume'), [{'threadId': 'saved-id', 'excludeTurns': True}])
+        self.assertEqual(self.calls(s, 'thread/goal/set'), [{
+            'threadId': 'saved-id', 'objective': objective, 'status': 'active', 'origin': 'user'}])
+        methods = [m for m, _ in s.calls]
+        self.assertLess(methods.index('thread/resume'), methods.index('thread/loaded/list'))
+        self.assertLess(methods.index('thread/loaded/list'), methods.index('thread/goal/set'))
+        for method in ('thread/start', 'turn/start', 'turn/steer', 'turn/interrupt', 'thread/settings/update', 'thread/read'):
+            self.assertEqual(self.calls(s, method), [])
+        output = json.loads(result.stdout)
+        self.assertEqual(output['action'], 'goal_set')
+        self.assertEqual(output['session_id'], 'saved-id')
+        self.assertEqual(output['goal']['objective'], objective)
+        self.assertEqual(output['goal']['status'], 'active')
+
+    def test_goal_resumes_unloaded_session(self):
+        self.check_goal_set(self.server())
+
+    def test_goal_sets_loaded_session(self):
+        self.check_goal_set(self.server(loaded=['saved-id']))
+
+    def test_goal_updates_busy_session_without_waiting(self):
+        s = self.server(loaded=['saved-id'], busy=True, wake=False)
+        self.check_goal_set(s)
+        self.assertTrue(s.busy)
+
+    def test_goal_resume_failure_does_not_set_goal(self):
+        s = self.server(resume_error=True)
+        result = self.run_cli(s, 'goal', 'missing-id', '完成任务')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('session not found', result.stderr)
+        self.assertEqual(len(self.calls(s, 'thread/resume')), 1)
+        self.assertEqual(self.calls(s, 'thread/goal/set'), [])
+
+    def test_goal_requires_loaded_after_resume(self):
+        s = self.server(resume_load=False)
+        result = self.run_cli(s, 'goal', 'saved-id', '完成任务')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('没有设置 goal', result.stderr)
+        self.assertEqual(self.calls(s, 'thread/goal/set'), [])
+
+    def test_goal_failures_do_not_retry_or_claim_success(self):
+        for option in ('goal_error', 'disconnect_goal', 'goal_mismatch'):
+            with self.subTest(option=option):
+                folder = self.root / option
+                folder.mkdir()
+                s = FakeServer(folder, **{option: True})
+                self.servers.append(s)
+                result = self.run_cli(s, 'goal', 'saved-id', '完成任务')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, '')
+                self.assertEqual(len(self.calls(s, 'thread/goal/set')), 1)
+                self.assertEqual(self.calls(s, 'turn/start'), [])
+
+    def test_goal_rejects_invalid_text_before_connecting(self):
+        s = self.server()
+        for objective in ('', ' \n\t', '中' * 4001):
+            with self.subTest(length=len(objective)):
+                result = self.run_cli(s, 'goal', 'saved-id', objective)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('goal 文本必须非空且最多 4000 字符', result.stderr)
+        self.assertEqual(s.calls, [])
+
+    def test_goal_accepts_4000_characters(self):
+        s = self.server()
+        result = self.run_cli(s, 'goal', 'saved-id', '中' * 4000)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls(s, 'thread/goal/set')[0]['objective'], '中' * 4000)
 
     def test_send_wait_timeout_no_polling(self):
         s = self.server(loaded=['member'], busy=True, wake=False)

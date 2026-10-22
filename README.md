@@ -9,6 +9,8 @@ codex-app-manager set *.json
 codex-app-manager delete *.json
 codex-app-manager send SESSION_ID '完整 prompt 文本'
 codex-app-manager send SESSION_ID '完整 prompt 文本' --timeout 600
+codex-app-manager send SESSION_ID '调整当前任务的执行方向' --force
+codex-app-manager goal SESSION_ID '完成实现并通过测试'
 codex-app-manager --socket /absolute/app.sock send SESSION_ID 'prompt'
 ```
 
@@ -42,11 +44,24 @@ team_prompt/base_prompt 是新成员初始化文本，set 不重新注入已有�
 无需先在 Desktop App 中手动打开会话；已加载的 Session 也通过此调用订阅事件。
 恢复时不覆盖已有配置，不创建新 Session；恢复失败时不发送 prompt。
 恢复后检查 thread/loaded/list 确认已加载；忙碌时等待完成/状态变化事件，
-复核 idle 后发送。不使用 turn/steer，不定时轮询模型。
+复核 idle 后发送，不定时轮询模型。
+加 --force 时，Session 正忙则读取当前 turn ID，通过 turn/steer 追加 prompt，
+不等待空闲、不打断当前 turn；空闲时仍通过 turn/start 发送。
+steer 成功输出 action=steered、session_id 和当前 turn_id。
+若读取后 turn 已结束或切换，或请求失败/结果未知，则报错，不自动重发或改发新 turn。
 默认一直等待；Ctrl+C 取消等待；--timeout 限制等待空闲的时间。
 --rpc-timeout（默认 30 秒）单独限制连接、RPC 和配置确认，不限制模型运行时间。
-成功返回只代表 App 已接受新 turn，输出 JSON 含 session_id 和 turn_id；
+成功返回只代表 App 已接受新 turn 或 steer 输入，输出 JSON 含 session_id 和 turn_id；
 不等待这次新 turn 运行结束，也不自动处理审批。审批请在 App 中处理。
+
+## goal：
+
+通过 thread/resume 恢复指定 ID 的已有 Session，确认已加载后调用 thread/goal/set，
+以用户操作（origin=user）将 goal 设为 active。goal 文本必须非空且最多 4000 字符。
+Session 正忙时直接设置，当前 turn 继续运行；不等待空闲、不另发 prompt。
+恢复时保留已有 Session 配置；恢复失败或未加载时不设置 goal。
+成功输出 JSON 含 action=goal_set、session_id 和服务端返回的 goal。
+RPC 失败或结果未知时不自动重试；需要运行中的 App，支持 --socket 和 --rpc-timeout。
 
 ## delete：
 
