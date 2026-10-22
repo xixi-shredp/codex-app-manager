@@ -38,9 +38,10 @@ team_prompt/base_prompt 是新成员初始化文本，set 不重新注入已有�
 
 ## send：
 
-只允许目标已经出现在当前 App 的 thread/loaded/list 中。
-不属于当前 App（包括未加载）的目标报错，不自动恢复。
-对已加载目标通过 thread/resume 订阅事件；忙碌时等待完成/状态变化事件，
+通过 thread/resume 将指定 ID 的已有 Session 恢复到当前 App 并订阅事件，
+无需先在 Desktop App 中手动打开会话；已加载的 Session 也通过此调用订阅事件。
+恢复时不覆盖已有配置，不创建新 Session；恢复失败时不发送 prompt。
+恢复后检查 thread/loaded/list 确认已加载；忙碌时等待完成/状态变化事件，
 复核 idle 后发送。不使用 turn/steer，不定时轮询模型。
 默认一直等待；Ctrl+C 取消等待；--timeout 限制等待空闲的时间。
 --rpc-timeout（默认 30 秒）单独限制连接、RPC 和配置确认，不限制模型运行时间。

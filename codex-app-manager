@@ -335,7 +335,7 @@ def loaded_ids(client):
 
 def require_owned(client, thread_id):
     if thread_id not in loaded_ids(client):
-        raise CliError(f'Session {thread_id} 不由当前 App app-server 持有（未加载）；send 不会自动恢复它。')
+        raise CliError(f'Session {thread_id} 未在当前 App app-server 中加载；没有发送 prompt。')
 
 
 def remaining(deadline):
@@ -697,7 +697,8 @@ def run_set(client, args):
 def run_send(client, args):
     deadline = None if args.timeout is None else time.monotonic() + args.timeout
     with session_lock(args.session_id, deadline):
-        require_owned(client, args.session_id)
+        # Resume also loads persisted sessions that the App has not opened yet.
+        # Keep overrides absent so their saved settings are preserved.
         client.call('thread/resume', {'threadId': args.session_id, 'excludeTurns': True})
         require_owned(client, args.session_id)
         wait_idle(client, args.session_id, remaining(deadline))
@@ -814,7 +815,7 @@ def build_parser():
     set_parser.add_argument('files', nargs='+', help='团队 JSON；支持 shell *.json')
     set_parser.add_argument('--timeout', type=float, help='等待已有 Session 空闲的最大秒数；默认持续等待')
     connection_options(set_parser, True)
-    send_parser = subparsers.add_parser('send', help='仅向当前 App 已加载的 Session 发送 prompt')
+    send_parser = subparsers.add_parser('send', help='自动恢复目标 Session，等待空闲后发送 prompt')
     send_parser.add_argument('session_id')
     send_parser.add_argument('prompt_text', help='完整 prompt 文本；包含空格时用引号包裹')
     send_parser.add_argument('--timeout', type=float, help='等待 Session 空闲的最大秒数；默认持续等待')

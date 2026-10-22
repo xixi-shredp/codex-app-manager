@@ -20,13 +20,14 @@ CLI = os.environ.get('CODEX_APP_MANAGER_CLI') or os.environ.get('CHATGPT_APP_SER
 
 
 class FakeServer:
-    def __init__(self, root, loaded=None, busy=False, wake=True, disconnect=False, fragmented=False, disconnect_create=False, settings_mismatch=False):
+    def __init__(self, root, loaded=None, busy=False, wake=True, disconnect=False, fragmented=False, disconnect_create=False, settings_mismatch=False, resume_error=False, resume_load=True):
         self.path = str(Path(root) / 'app.sock')
         self.loaded = list(loaded or [])
         self.busy, self.wake = busy, wake
         self.disconnect, self.fragmented = disconnect, fragmented
         self.disconnect_create = disconnect_create
         self.settings_mismatch = settings_mismatch
+        self.resume_error, self.resume_load = resume_error, resume_load
         self.calls = []
         self.errors = []
         self.settings = {}
@@ -84,7 +85,7 @@ class FakeServer:
             return {'userAgent': 'fake-app'}
         if method == 'thread/loaded/list':
             return {'data': self.loaded, 'nextCursor': None}
-        if method in ('thread/start', 'thread/resume') and tid not in self.loaded:
+        if (method == 'thread/start' or method == 'thread/resume' and self.resume_load) and tid not in self.loaded:
             self.loaded.append(tid)
         if method in ('thread/start', 'thread/resume', 'thread/settings/update'):
             self.settings.setdefault(tid, {}).update({k: v for k, v in p.items() if v is not None})
@@ -146,7 +147,10 @@ class FakeServer:
                         break
                     if self.disconnect_create and method == 'thread/start':
                         break
-                    response = {'id': request['id'], 'result': self.result(method, p)}
+                    if method == 'thread/resume' and self.resume_error:
+                        response = {'id': request['id'], 'error': {'code': -32600, 'message': 'session not found'}}
+                    else:
+                        response = {'id': request['id'], 'result': self.result(method, p)}
                     if self.fragmented and method == 'initialize':
                         raw = json.dumps(response).encode()
                         mid = len(raw) // 2
@@ -261,12 +265,42 @@ class CLITests(unittest.TestCase):
         self.assertEqual(self.calls(s, 'thread/start'), [])
         self.assertIsNone(json.loads(p.read_text())['sessions'][0]['id'])
 
-    def test_send_refuses_unloaded(self):
+    def test_send_resumes_unloaded_before_sending(self):
         s = self.server()
-        result = self.run_cli(s, 'send', 'outsider', '测试')
+        result = self.run_cli(s, 'send', 'saved-id', '测试 Unicode')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls(s, 'thread/resume'), [{'threadId': 'saved-id', 'excludeTurns': True}])
+        self.assertEqual(self.calls(s, 'turn/start'), [{'threadId': 'saved-id', 'input': [{'type': 'text', 'text': '测试 Unicode'}]}])
+        self.assertEqual(self.calls(s, 'thread/start'), [])
+        methods = [m for m, _ in s.calls]
+        self.assertLess(methods.index('thread/resume'), methods.index('thread/loaded/list'))
+        self.assertLess(methods.index('thread/read'), methods.index('turn/start'))
+        self.assertEqual(json.loads(result.stdout), {'action': 'sent', 'session_id': 'saved-id', 'turn_id': 'turn-1'})
+
+    def test_send_resume_error_does_not_send_or_create(self):
+        s = self.server(resume_error=True)
+        result = self.run_cli(s, 'send', 'missing-id', '测试')
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(self.calls(s, 'thread/resume'), [])
+        self.assertIn('session not found', result.stderr)
+        self.assertEqual(len(self.calls(s, 'thread/resume')), 1)
+        self.assertEqual(self.calls(s, 'thread/start'), [])
         self.assertEqual(self.calls(s, 'turn/start'), [])
+
+    def test_send_requires_loaded_after_resume(self):
+        s = self.server(resume_load=False)
+        result = self.run_cli(s, 'send', 'saved-id', '测试')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(self.calls(s, 'thread/resume')), 1)
+        self.assertEqual(self.calls(s, 'turn/start'), [])
+
+    def test_send_resumed_busy_session_waits_for_event(self):
+        s = self.server(busy=True)
+        result = self.run_cli(s, 'send', 'saved-id', '测试', '--timeout', '2')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(s.busy)
+        self.assertGreaterEqual(len(self.calls(s, 'thread/read')), 2)
+        self.assertEqual(len(self.calls(s, 'thread/resume')), 1)
+        self.assertEqual(len(self.calls(s, 'turn/start')), 1)
 
     def test_send_busy_waits_for_event(self):
         s = self.server(loaded=['member'], busy=True)
