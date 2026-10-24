@@ -512,6 +512,11 @@ def validate_team(document, path):
             ids.add(thread_id)
         if not isinstance(item.get('base_prompt'), str):
             raise CliError(f'{field}: base_prompt 必须为字符串。')
+        goal = item.get('goal')
+        if goal is not None and (not isinstance(goal, str) or len(goal) > 4000):
+            raise CliError(f'{field}: goal 必须为最多 4000 字符的字符串或 null。')
+        if isinstance(goal, str) and not goal.strip():
+            goal = None
         cwd = item.get('cwd', defaults.get('cwd', '.'))
         if not isinstance(cwd, str) or not cwd:
             raise CliError(f'{field}: cwd 必须为非空字符串。')
@@ -539,7 +544,8 @@ def validate_team(document, path):
         if any(obj.get('permissions') is not None for obj in [defaults, item]):
             raise CliError(f'{field}: 本工具使用 sandbox 字段，不支持 permissions。')
         members.append({'index': index, 'name': name, 'id': thread_id, 'cwd': str(cwd),
-                        'options': options, 'prompt': document['team_prompt'] + '\n\n' + item['base_prompt']})
+                        'options': options, 'goal': goal,
+                        'prompt': document['team_prompt'] + '\n\n' + item['base_prompt']})
     return members
 
 
@@ -656,6 +662,8 @@ def run_set(client, args):
                         wait_idle(client, member['id'], remaining(deadline))
                         apply_settings(client, member)
                         client.call('thread/name/set', {'threadId': member['id'], 'name': member['name']})
+                        if member['goal'] is not None:
+                            set_goal(client, member['id'], member['goal'])
                     emit(action='updated', session_id=member['id'], name=member['name'], prompt_sent=False)
                     continue
                 team.state(member['name'], status='creating')
@@ -690,6 +698,8 @@ def run_set(client, args):
                 if not turn_id:
                     raise CliError(f'{member["name"]}: turn/start 未返回有效 turn ID；不重发。')
                 team.state(member['name'], status='initial_prompt_sent', id=member['id'], turn_id=turn_id)
+                if member['goal'] is not None:
+                    set_goal(client, member['id'], member['goal'])
                 emit(action='created', session_id=member['id'], name=member['name'],
                      turn_id=turn_id, prompt_sent=True)
 
@@ -730,19 +740,24 @@ def run_send(client, args):
         emit(action='sent', session_id=args.session_id, turn_id=turn_id)
 
 
+def set_goal(client, thread_id, objective):
+    response = client.call('thread/goal/set', {
+        'threadId': thread_id, 'objective': objective,
+        'status': 'active', 'origin': 'user',
+    })
+    goal = response.get('goal')
+    if (not isinstance(goal, dict) or goal.get('threadId') != thread_id
+            or goal.get('objective') != objective or goal.get('status') != 'active'):
+        raise CliError('thread/goal/set 未返回匹配的 active goal；请求结果未知，不重试。')
+    return goal
+
+
 def run_goal(client, args):
     with session_lock(args.session_id):
         client.call('thread/resume', {'threadId': args.session_id, 'excludeTurns': True})
         require_owned(client, args.session_id, action='设置 goal')
         # An explicit user command may update the goal while a turn is active.
-        response = client.call('thread/goal/set', {
-            'threadId': args.session_id, 'objective': args.goal_text,
-            'status': 'active', 'origin': 'user',
-        })
-        goal = response.get('goal')
-        if (not isinstance(goal, dict) or goal.get('threadId') != args.session_id
-                or goal.get('objective') != args.goal_text or goal.get('status') != 'active'):
-            raise CliError('thread/goal/set 未返回匹配的 active goal；请求结果未知，不重试。')
+        goal = set_goal(client, args.session_id, args.goal_text)
         emit(action='goal_set', session_id=args.session_id, goal=goal)
 
 

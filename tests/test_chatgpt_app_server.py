@@ -256,6 +256,90 @@ class CLITests(unittest.TestCase):
         self.assertEqual(update['model'], 'gpt-6.1-sol')
         self.assertEqual(update['cwd'], str(self.root / 'work'))
 
+    def test_set_new_session_goal_after_initial_prompt(self):
+        s = self.server()
+        objective = '完成实现 α\n通过全部测试'
+        p = self.team(goal=objective)
+        result = self.run_cli(s, 'set', str(p))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls(s, 'thread/goal/set'), [{
+            'threadId': 'new-id', 'objective': objective, 'status': 'active', 'origin': 'user'}])
+        methods = [m for m, _ in s.calls]
+        self.assertLess(methods.index('thread/start'), methods.index('thread/goal/set'))
+        self.assertLess(methods.index('turn/start'), methods.index('thread/goal/set'))
+        self.assertEqual(self.calls(s, 'turn/start')[0]['input'][0]['text'], '团队任务\n\n成员任务')
+        document = json.loads(p.read_text())
+        self.assertEqual(document['sessions'][0]['id'], 'new-id')
+        self.assertEqual(document['sessions'][0]['goal'], objective)
+
+    def test_set_existing_session_goal_after_resume_without_prompt(self):
+        s = self.server()
+        p = self.team(id='old-id', goal='完成任务')
+        result = self.run_cli(s, 'set', str(p))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls(s, 'thread/goal/set'), [{
+            'threadId': 'old-id', 'objective': '完成任务', 'status': 'active', 'origin': 'user'}])
+        methods = [m for m, _ in s.calls]
+        self.assertLess(methods.index('thread/resume'), methods.index('thread/goal/set'))
+        self.assertLess(methods.index('thread/settings/update'), methods.index('thread/goal/set'))
+        self.assertEqual(self.calls(s, 'thread/start'), [])
+        self.assertEqual(self.calls(s, 'turn/start'), [])
+        self.assertFalse(json.loads(result.stdout)['prompt_sent'])
+
+    def test_set_skips_missing_null_and_blank_goals(self):
+        s = self.server()
+        for fields in ({}, {'goal': None}, {'goal': ''}, {'goal': ' \n\t'}):
+            with self.subTest(fields=fields):
+                p = self.team(id='old-id', **fields)
+                document = json.loads(p.read_text())
+                document['defaults']['goal'] = '不应继承'
+                p.write_text(json.dumps(document))
+                result = self.run_cli(s, 'set', str(p))
+                self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls(s, 'thread/goal/set'), [])
+        self.assertEqual(self.calls(s, 'thread/goal/clear'), [])
+
+    def test_set_prevalidates_goal_before_any_mutation(self):
+        s = self.server()
+        good = self.team(goal='有效目标')
+        for goal in (42, False, [], {}, '中' * 4001):
+            with self.subTest(goal_type=type(goal).__name__):
+                document = json.loads(good.read_text())
+                document['sessions'][0]['goal'] = goal
+                bad = self.root / 'bad.json'
+                bad.write_text(json.dumps(document))
+                result = self.run_cli(s, 'set', str(good), str(bad))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('sessions[0]: goal', result.stderr)
+        for method in ('thread/start', 'thread/resume', 'thread/goal/set', 'turn/start'):
+            self.assertEqual(self.calls(s, method), [])
+
+    def test_set_goal_failure_preserves_new_id_and_sent_initial_prompt(self):
+        s = self.server(goal_error=True)
+        p = self.team(goal='完成任务')
+        result = self.run_cli(s, 'set', str(p))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('goal rejected', result.stderr)
+        self.assertEqual(json.loads(p.read_text())['sessions'][0]['id'], 'new-id')
+        self.assertEqual(len(self.calls(s, 'thread/goal/set')), 1)
+        self.assertEqual(len(self.calls(s, 'turn/start')), 1)
+        journal = json.loads((self.root / '.team.json.codex-app-manager-state').read_text())
+        self.assertEqual(journal['工程师 α']['status'], 'initial_prompt_sent')
+        s.goal_error = False
+        result = self.run_cli(s, 'set', str(p))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.calls(s, 'turn/start')), 1)
+        self.assertEqual(len(self.calls(s, 'thread/goal/set')), 2)
+
+    def test_set_unknown_initial_prompt_result_does_not_set_goal(self):
+        s = self.server(disconnect=True)
+        p = self.team(goal='完成任务')
+        result = self.run_cli(s, 'set', str(p))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(self.calls(s, 'turn/start')), 1)
+        self.assertEqual(self.calls(s, 'thread/goal/set'), [])
+        self.assertEqual(result.stdout, '')
+
     def test_existing_matching_settings_need_no_update_event(self):
         s = self.server(loaded=['old-id'])
         p = self.team(id='old-id', sandbox='danger-full-access')

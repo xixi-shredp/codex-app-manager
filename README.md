@@ -20,7 +20,7 @@ codex-app-manager --socket /absolute/app.sock send SESSION_ID 'prompt'
 正常环境必须能在 PATH 找到 codex。也可显式指定已经运行的 App socket。
 
 JSON 格式沿用 schema_version=1、team_prompt、defaults、sessions。
-成员字段：name、id（null 或现有 ID）、cwd、base_prompt。
+成员字段：name、id（null 或现有 ID）、cwd、base_prompt、goal（可选）。
 cwd 相对 JSON 所在目录解析。defaults.cwd 可作为成员默认目录。
 配置字段可放 defaults 或成员中：model、reasoning_effort、sandbox、
 approval_policy、approvals_reviewer、service_tier、summary。
@@ -37,6 +37,11 @@ id 为 null 时创建新的持久 Session，立即原子回写真实 ID。
 更新名称，但不发送任何 prompt。配置未变化时服务端不会发送更新通知。
 team_prompt/base_prompt 是新成员初始化文本，set 不重新注入已有成员的初始化文本。
 接受一个或多个 JSON；全部 JSON 先校验，再操作 App。
+成员的 goal 为非空字符串时，为该 Session 设置 active goal；新 Session 先发送初始
+prompt，收到 turn/start 成功响应后再设置 goal，不等待该 turn 运行结束。
+已有 Session 在恢复并完成配置更新后设置。goal 最多 4000 字符。
+省略 goal、设为 null、空字符串或纯空白时跳过，保留会话原有 goal；不继承 defaults.goal。
+例如：`{"name":"工程师","id":null,"cwd":".","base_prompt":"开始工作","goal":"完成实现并通过测试"}`。
 
 ## send：
 
